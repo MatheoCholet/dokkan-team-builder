@@ -1,8 +1,7 @@
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
 import json
 import uuid
+import re
 from google import genai
 from google.genai import types
 
@@ -16,17 +15,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Injection de CSS personnalisé (Thème Dragon Ball Z)
+# Injection du CSS personnalisé (Thème Dragon Ball Z)
 st.markdown("""
 <style>
-    /* Arrière-plan global : Cosmos / Aura */
+    /* Arrière-plan global : Cosmos / Aura sombre */
     .stApp {
         background-color: #0b1120;
         background-image: radial-gradient(circle at top right, #1a2235, #0b1120);
         color: #f1f5f9;
     }
     
-    /* Typographie des titres : Orange emblématique */
+    /* Typographie des titres : Orange emblématique DBZ */
     h1, h2, h3 {
         color: #ff9800 !important;
         text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.9);
@@ -35,7 +34,7 @@ st.markdown("""
         letter-spacing: 1px;
     }
     
-    /* Boutons d'action : Style Super Saiyan */
+    /* Boutons d'action : Style Aura Super Saiyan */
     .stButton>button {
         background: linear-gradient(45deg, #e65100, #ffb300);
         color: #ffffff !important;
@@ -59,7 +58,7 @@ st.markdown("""
         border: 1px solid #ff9800 !important;
         border-radius: 5px;
     }
-    .stTextInput>div>div>input:focus {
+    .stTextInput>div>div>input:focus, .stTextArea>div>div>textarea:focus {
         box-shadow: 0 0 10px rgba(255, 152, 0, 0.5) !important;
     }
     
@@ -135,7 +134,7 @@ def normaliser_personnage(item: dict) -> dict:
     }
 
 def maj_doublons(char_id: str, widget_key: str):
-    """Callback sécurisé pour la mise à jour des doublons."""
+    """Callback sécurisé pour la mise à jour des doublons sans rechargement cyclique."""
     for char in st.session_state.box:
         if char["_id"] == char_id:
             char["doublons"] = st.session_state[widget_key]
@@ -145,108 +144,81 @@ def supprimer_personnage(char_id: str):
     """Supprime un personnage par son UUID."""
     st.session_state.box = [c for c in st.session_state.box if c["_id"] != char_id]
 
-# ==========================================
-# SCRAPING ANTI-BOT & FALLBACK INTELLIGENT
-# ==========================================
-@st.cache_data(show_spinner=False, ttl=86400)
-def extraire_texte_brut(url: str) -> str:
-    """Tente un scraping classique. Détecte le blocage Cloudflare pour activer le fallback."""
-    if not url or "dbz-dokkanbattle.com" not in url:
-        return ""
-    
+def nettoyer_et_parser_json(texte: str) -> str:
+    """Nettoie les balises Markdown éventuelles renvoyées par le LLM et valide le JSON."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
+        # Recherche d'un bloc de code JSON
+        match = re.search(r'```(?:json)?(.*?)```', texte, re.DOTALL | re.IGNORECASE)
+        texte_propre = match.group(1).strip() if match else texte.strip()
         
-        # Fast-fail si Cloudflare bloque
-        if response.status_code in [401, 403] or "cloudflare" in response.text.lower() or "just a moment" in response.text.lower():
-            return "ERREUR_BLOCAGE"
-            
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        for element in soup(["script", "style", "nav", "footer", "header"]):
-            element.extract()
-            
-        texte = soup.get_text(separator=' ', strip=True)
-        return texte[:8000]
+        # Validation du JSON
+        donnees = json.loads(texte_propre)
+        return json.dumps(donnees, indent=2, ensure_ascii=False)
     except Exception:
-        return "ERREUR_BLOCAGE"
+        # En cas d'échec de parsing, on retourne un JSON d'erreur formaté
+        return json.dumps({"erreur": "Format inexploitable généré par l'IA", "brut": texte[:200]}, ensure_ascii=False)
 
+# ==========================================
+# LLM AS A DATABASE (BASE DE DONNÉES IA)
+# ==========================================
 @st.cache_data(show_spinner=False, ttl=86400)
-def structurer_donnees_llm(texte_brut: str, type_donnee: str, api_key: str, nom_entite: str = "", url: str = "") -> str:
-    """Parse le texte avec Gemini 3.1 Pro. Si bloqué, utilise Google Search Grounding pour trouver les stats."""
-    if not api_key:
+def generer_profil_dokkan_llm(nom_entite: str, type_donnee: str, api_key: str, url_indication: str = "") -> str:
+    """
+    Suppression totale du scraping. L'IA utilise sa propre base de connaissances 
+    pour générer le profil JSON d'une carte ou d'un boss.
+    """
+    if not api_key or not nom_entite:
         return "{}"
 
-    client = genai.Client(api_key=api_key)
-    echec_scraping = not texte_brut or "ERREUR_BLOCAGE" in texte_brut
-
     try:
+        client = genai.Client(api_key=api_key)
+        
         if type_donnee == "carte":
             instruction = (
-                "Tu es l'expert absolu de Dokkan Battle. Réponds UNIQUEMENT en format JSON avec les clés : "
-                "'leader_skill', 'aptitude_passive' (incluant garde, réduction, esquive, stack), 'liens', et 'statistiques_max'. "
-                "Aucun commentaire en dehors du JSON."
+                "Tu es la base de données ultime de Dragon Ball Z: Dokkan Battle. "
+                "Réponds UNIQUEMENT en format JSON strict. Tu dois générer les statistiques au stade MAXIMAL "
+                "(UR, LR, Z-TUR, ou Super Z-TUR) de la carte demandée. "
+                "Clés obligatoires : 'leader_skill', 'aptitude_passive' (détaille la garde, réduction, esquive, stack de stats), "
+                "'liens', et 'statistiques_max'."
             )
-            if echec_scraping:
-                prompt = (
-                    f"Le site a bloqué la connexion. Utilise ton outil de recherche Google pour trouver "
-                    f"des informations précises sur la carte Dokkan Battle nommée '{nom_entite}' (Lien de réf: {url}). "
-                    f"Trouve son passif, ses liens et statistiques à son éveil maximal (UR/LR/Z-TUR), puis génère le JSON."
-                )
-            else:
-                prompt = f"Analyse ce texte extrait de la carte '{nom_entite}' :\n\n{texte_brut}"
-                
+            prompt = (
+                f"Génère le profil JSON complet de la carte Dokkan Battle nommée : '{nom_entite}'. "
+                f"(Indication URL éventuelle pour t'aider à l'identifier : {url_indication})"
+            )
         else: # type_donnee == "boss"
             instruction = (
-                "Tu es l'expert absolu de Dokkan Battle. Réponds UNIQUEMENT en format JSON avec les clés : "
-                "'type_elementaire', 'immunites' (stun, blocage), 'attaques_de_zone' et 'mecaniques_speciales'. "
-                "Aucun commentaire en dehors du JSON."
+                "Tu es la base de données ultime de Dragon Ball Z: Dokkan Battle. "
+                "Réponds UNIQUEMENT en format JSON strict. Tu dois générer les mécaniques du boss/événement demandé. "
+                "Clés obligatoires : 'type_elementaire', 'immunites' (ex: stun, blocage de spé), "
+                "'attaques_de_zone' (booléen ou description) et 'mecaniques_speciales' (ex: annulation d'esquive, etc.)."
             )
-            if echec_scraping:
-                prompt = (
-                    f"Le site a bloqué la connexion. Lance une recherche web (Google Search) pour trouver "
-                    f"les spécificités et mécaniques du Boss/Événement Dokkan Battle nommé '{nom_entite}' (Lien de réf: {url}). "
-                    f"Identifie ses immunités, ses dégâts et particularités, puis génère le JSON."
-                )
-            else:
-                prompt = f"Analyse ce texte brut pour l'événement '{nom_entite}' :\n\n{texte_brut}"
-
-        # Paramétrage dynamique de l'API (JSON natif VS Outil de Recherche)
-        config_args = {
-            "system_instruction": instruction,
-            "temperature": 0.2 if echec_scraping else 0.0
-        }
-        
-        if echec_scraping:
-            config_args["tools"] = [{"google_search": {}}]
-        else:
-            config_args["response_mime_type"] = "application/json"
+            prompt = (
+                f"Génère le profil JSON complet de l'événement / boss Dokkan Battle nommé : '{nom_entite}'. "
+                f"(Indication URL éventuelle pour t'aider à l'identifier : {url_indication})"
+            )
 
         reponse = client.models.generate_content(
             model='gemini-3.1-pro-preview',
             contents=prompt,
-            config=types.GenerateContentConfig(**config_args)
+            config=types.GenerateContentConfig(
+                system_instruction=instruction,
+                temperature=0.1, # Température basse pour privilégier la précision des stats
+                response_mime_type="application/json" # Force la sortie en format JSON
+            )
         )
         
-        # Nettoyage strict (sécurité contre les balises markdown)
-        clean_json_str = reponse.text.replace("```json", "").replace("```", "").strip()
-        
-        try:
-            parsed_json = json.loads(clean_json_str)
-            return json.dumps(parsed_json, indent=2, ensure_ascii=False)
-        except json.JSONDecodeError:
-            return clean_json_str
+        # Nettoyage et sécurisation du JSON renvoyé
+        return nettoyer_et_parser_json(reponse.text)
             
     except Exception as e:
-        return f'{{"erreur": "Échec de l\'IA : {str(e)}"}}'
+        return json.dumps({"erreur": f"Échec de l'IA : {str(e)}"}, ensure_ascii=False)
 
 # ==========================================
 # BARRE LATÉRALE : SÉCURITÉ ET SAUVEGARDES
 # ==========================================
 st.sidebar.title("⚙️ Radar Dragon")
 
+# Masquage absolu de la clé API
 api_key = st.secrets.get("GEMINI_API_KEY", None)
 if api_key:
     st.sidebar.success("🟢 Connexion établie avec l'IA")
@@ -268,7 +240,7 @@ if fichier_upload is not None:
             st.session_state.box = [normaliser_personnage(item) for item in data]
             st.sidebar.success("✅ Données de la box chargées !")
         else:
-            st.sidebar.error("❌ Format invalide (liste attendue).")
+            st.sidebar.error("❌ Format invalide (liste de cartes attendue).")
     except Exception:
         st.sidebar.error("❌ Erreur de lecture du fichier JSON.")
 
@@ -286,7 +258,7 @@ if st.session_state.box:
 # INTERFACE PRINCIPALE
 # ==========================================
 st.title("🐉 Dokkan Team Builder")
-st.markdown("Assemblez votre équipe de guerriers ultime. L'IA analyse les données en temps réel pour contrer les mécaniques des boss.")
+st.markdown("Assemblez votre équipe de guerriers ultime. Le moteur IA analyse ses mémoires pour contrer les boss les plus difficiles.")
 
 onglet_box, onglet_event, onglet_analyse = st.tabs(["🛡️ Inventaire", "🎯 Cible (Boss)", "🧠 Stratégie d'Équipe"])
 
@@ -299,9 +271,9 @@ with onglet_box:
     with st.form("ajout_perso_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            nom_perso = st.text_input("Nom de la carte (ex: Son Gohan Beast, Goku SSJ4)")
+            nom_perso = st.text_input("Nom du personnage (ex: Son Gohan Beast, Broly DBS)")
         with col2:
-            url_perso = st.text_input("URL dbz-dokkanbattle.com (Utile pour guider l'IA en cas de doute)")
+            url_perso = st.text_input("URL Wiki/Dokkaninfo (Optionnel - Utilisé comme indice par l'IA)")
             
         c_type, c_rar, c_dup, c_ztur = st.columns(4)
         with c_type:
@@ -309,12 +281,12 @@ with onglet_box:
         with c_rar:
             rarete_perso = st.selectbox("Rareté", ["SSR", "UR", "LR"])
         with c_dup:
-            doublons_perso = st.number_input("Doublons", min_value=0, max_value=4, step=1)
+            doublons_perso = st.number_input("Doublons (Arbre de comp.)", min_value=0, max_value=4, step=1)
         with c_ztur:
             st.write("") 
             ztur_perso = st.checkbox("Z-TUR / Super Z-TUR ?")
             
-        if st.form_submit_button("➕ Ajouter à la Box"):
+        if st.form_submit_button("➕ Ajouter à l'inventaire"):
             if nom_perso.strip():
                 nouvel_item = {
                     "nom": nom_perso.strip(),
@@ -325,21 +297,20 @@ with onglet_box:
                     "z_tur": ztur_perso
                 }
                 st.session_state.box.append(normaliser_personnage(nouvel_item))
-                st.success(f"✅ {nom_perso.strip()} a été ajouté à l'inventaire.")
+                st.success(f"✅ {nom_perso.strip()} a rejoint votre box !")
                 st.rerun()
             else:
-                st.warning("⚠️ Le nom du personnage est requis.")
+                st.warning("⚠️ Le nom du personnage est requis pour l'enregistrer.")
 
     st.divider()
-    st.subheader(f"Vos Guerriers ({len(st.session_state.box)})")
+    st.subheader(f"Vos Guerriers ({len(st.session_state.box)} cartes)")
     
     if st.session_state.box:
         for perso in st.session_state.box:
             st.markdown('<div class="dbz-card">', unsafe_allow_html=True)
             c_nom, c_infos, c_doublon, c_action = st.columns([4, 3, 2, 1])
             
-            lien = f" [🔗]({perso['url']})" if perso.get('url') else ""
-            c_nom.markdown(f"<h4 style='margin:0; color:#ff9800;'>{perso['nom']}{lien}</h4>", unsafe_allow_html=True)
+            c_nom.markdown(f"<h4 style='margin:0; color:#ff9800;'>{perso['nom']}</h4>", unsafe_allow_html=True)
             
             ztur_txt = " | 🌟 Z-TUR" if perso['z_tur'] else ""
             c_infos.markdown(f"**{perso['type']}** | {perso['rarete']}{ztur_txt}")
@@ -363,37 +334,36 @@ with onglet_box:
         st.info("La box est vide. Importez un fichier JSON ou ajoutez des unités.")
 
 # ------------------------------------------
-# ONGLET 2 : LE BOSS (AVEC FALLBACK GOOGLE)
+# ONGLET 2 : LE BOSS (LLM DATABASE)
 # ------------------------------------------
 with onglet_event:
     st.subheader("Analyse de la Menace")
+    st.markdown("Saisissez le nom du niveau. L'IA va interroger ses mémoires internes pour reconstituer les mécaniques du boss.")
     
     nom_boss = st.text_input("Nom de l'événement ou du Boss (Obligatoire, ex: Red Zone Broly, SBR Divin)")
-    url_boss = st.text_input("URL dbz-dokkanbattle.com (Optionnelle)")
+    url_boss = st.text_input("URL Wiki/Dokkaninfo (Optionnel - Indice supplémentaire pour l'IA)")
     details_manuels = st.text_area("Notes manuelles du combat (Optionnel)", height=100)
     
     st.session_state.nom_boss = nom_boss
     st.session_state.details_manuels = details_manuels
     
-    if st.button("🔍 Extraire les mécaniques du Boss", type="secondary"):
+    if st.button("🔍 Interroger l'IA sur ce Boss", type="secondary"):
         if not api_key:
             st.warning("⚠️ Clé API Gemini requise pour utiliser cette fonction.")
-        elif not nom_boss:
-            st.warning("⚠️ Veuillez indiquer le nom de l'événement pour guider l'analyse.")
+        elif not nom_boss.strip():
+            st.warning("⚠️ Veuillez impérativement saisir le nom de l'événement pour l'analyse.")
         else:
-            with st.spinner("Analyse en cours (Scraping ou Recherche web via IA)..."):
-                texte_boss_brut = extraire_texte_brut(url_boss) if url_boss else "ERREUR_BLOCAGE"
-                
-                donnees_boss_json = structurer_donnees_llm(
-                    texte_boss_brut, "boss", api_key, nom_entite=nom_boss, url=url_boss
+            with st.spinner("Recherche des mécaniques dans la base de données neuronale de l'IA..."):
+                donnees_boss_json = generer_profil_dokkan_llm(
+                    nom_entite=nom_boss, type_donnee="boss", api_key=api_key, url_indication=url_boss
                 )
                 
                 st.session_state.details_boss_auto = donnees_boss_json
                 
                 if "erreur" in donnees_boss_json.lower():
-                    st.error("❌ Échec de l'extraction des données du boss.")
+                    st.error("❌ Échec de la génération des données du boss.")
                 else:
-                    st.success("✅ Mécaniques du boss identifiées et sauvegardées.")
+                    st.success("✅ Mécaniques de l'adversaire récupérées avec succès !")
                     st.code(donnees_boss_json, language="json")
 
 # ------------------------------------------
@@ -404,7 +374,7 @@ with onglet_analyse:
     
     if st.button("🚀 Créer l'Équipe Ultime", type="primary", use_container_width=True):
         if not api_key:
-            st.warning("⚠️ Clé API Gemini manquante. Veuillez vérifier le panneau latéral.")
+            st.warning("⚠️ Clé API Gemini manquante. Veuillez vérifier le Radar Dragon (Panneau latéral).")
         elif len(st.session_state.box) < 6:
             st.warning("⚠️ Il faut au moins 6 personnages dans la box pour former une équipe complète.")
         elif not st.session_state.get('nom_boss'):
@@ -414,25 +384,24 @@ with onglet_analyse:
             texte_statut = st.empty()
             
             try:
-                # 1. Compilation sécurisée des données de la box
+                # 1. Génération des profils des cartes via l'IA
                 contexte_box = ""
                 total_persos = len(st.session_state.box)
                 
                 for index, perso in enumerate(st.session_state.box):
-                    texte_statut.write(f"Analyse approfondie : {perso['nom']} ({index+1}/{total_persos})...")
+                    texte_statut.write(f"Récupération des données pour {perso['nom']} ({index+1}/{total_persos})...")
                     barre_progression.progress((index + 1) / total_persos)
                     
                     contexte_box += f"\n### Carte : {perso['nom']}\n"
-                    contexte_box += f"- Attributs : Type {perso['type']}, Rareté actuelle : {perso['rarete']}, Doublons : {perso['doublons']}\n"
+                    contexte_box += f"- Attributs bruts : Type {perso['type']}, Rareté actuelle dans la box : {perso['rarete']}, Doublons : {perso['doublons']}\n"
                     
-                    # Fallback automatique si scraping bloqué
-                    texte_carte_brut = extraire_texte_brut(perso['url']) if perso.get('url') else "ERREUR_BLOCAGE"
-                    donnees_carte_json = structurer_donnees_llm(
-                        texte_carte_brut, "carte", api_key, nom_entite=perso['nom'], url=perso.get('url', '')
+                    # Interrogation de la base de connaissances Gemini pour chaque carte
+                    donnees_carte_json = generer_profil_dokkan_llm(
+                        nom_entite=perso['nom'], type_donnee="carte", api_key=api_key, url_indication=perso.get('url', '')
                     )
-                    contexte_box += f"- Mécaniques (Extraites ou déduites) : {donnees_carte_json}\n"
+                    contexte_box += f"- Profil de combat (Généré par l'IA) : {donnees_carte_json}\n"
 
-                texte_statut.write("Formation de l'équipe par Gemini 3.1 Pro Preview...")
+                texte_statut.write("Calcul des synergies et formation de l'équipe (Gemini 3.1 Pro Preview)...")
 
                 # 2. Instructions Système Strictes
                 instructions = (
@@ -440,19 +409,19 @@ with onglet_analyse:
                     "RÈGLES ABSOLUES ET IMPÉRATIVES :\n"
                     "1. LANGUE : Toutes tes explications DOIVENT être 100% en français.\n"
                     "2. EXCLUSIVITÉ DE LA BOX : Tu DOIS sélectionner EXACTEMENT 6 personnages (1 Leader, 5 Sous-unités) "
-                    "UNIQUEMENT à partir de l'inventaire fourni. Ne propose aucune autre unité. L'Ami Leader (7ème perso) est libre.\n"
-                    "3. ÉVALUATION AU PLEIN POTENTIEL : C'est primordial. Si une carte de la box est 'SSR' ou 'UR' mais qu'elle a un éveil LR ou Z-TUR "
-                    "dans le jeu (ou d'après le JSON extrait), évalue-la OBLIGATOIREMENT selon ses statistiques et son passif au STADE MAXIMAL. "
-                    "Ne juge jamais une carte sur sa rareté d'origine. Si tu l'intègres, tu DOIS écrire à côté de son nom : "
+                    "UNIQUEMENT à partir de l'inventaire fourni en contexte. L'Ami Leader (7ème perso) est libre de ton choix.\n"
+                    "3. ÉVALUATION AU PLEIN POTENTIEL : C'est primordial. Si une carte de la box est 'SSR' ou 'UR' mais possède un éveil LR ou Z-TUR "
+                    "d'après le profil généré, tu DOIS l'évaluer selon ses statistiques et son passif au STADE MAXIMAL "
+                    "(UR, LR, Z-TUR ou Super Z-TUR). Ne juge jamais une carte sur sa rareté d'origine. Si tu intègres une telle carte, tu DOIS écrire à côté de son nom : "
                     "'⚠️ À éveiller en UR/LR / Z-TUR pour ce combat'.\n"
-                    "4. STRATÉGIE SURVIVALISTE : Appuie-toi sur la Garde, la Réduction et l'Esquive face aux attaques (JSON) du Boss.\n\n"
+                    "4. STRATÉGIE SURVIVALISTE : Appuie-toi fortement sur la Garde, la Réduction de Dégâts et l'Esquive face aux attaques du Boss.\n\n"
                     "FORMAT ATTENDU EN MARKDOWN :\n"
                     "🏆 **Leader** (Nom exact + Bonus de Leader)\n"
-                    "👥 **Équipe** (Les 5 autres cartes avec mentions d'éveil si nécessaire)\n"
+                    "👥 **Équipe** (Les 5 autres cartes, avec mentions d'éveil si nécessaire)\n"
                     "🤝 **Ami Leader recommandé**\n"
                     "🔄 **Rotations Principales** (Rotation 1 : Slots 1 & 2 | Rotation 2 : Slots 1 & 2)\n"
                     "🎈 **Flotteurs** (Les 3 unités en Slot 3)\n"
-                    "📜 **Stratégie de Survie** (Explications des rotations et des objets de soutien)."
+                    "📜 **Stratégie de Survie** (Explications des synergies, rotations, et objets de soutien à prévoir)."
                 )
 
                 # 3. Prompt Final
@@ -460,22 +429,22 @@ with onglet_analyse:
                 details_manuels = st.session_state.get('details_manuels', "")
                 
                 prompt_utilisateur = f"""
-                **Adversaire :** {st.session_state.nom_boss}
-                **Mécaniques du Boss (JSON) :** {infos_boss_auto}
+                **Adversaire Ciblé :** {st.session_state.nom_boss}
+                **Profil du Boss (JSON) :** {infos_boss_auto}
                 **Notes manuelles du joueur :** {details_manuels}
 
-                **Mon Inventaire (Pioche UNIQUEMENT 6 cartes ici, et évalue-les à plein potentiel) :**
+                **Mon Inventaire (Sélectionne 6 cartes ICI, à évaluer à leur plein potentiel) :**
                 {contexte_box}
                 """
 
-                # 4. Exécution API
+                # 4. Exécution API pour la génération finale
                 client = genai.Client(api_key=api_key)
                 reponse_equipe = client.models.generate_content(
                     model='gemini-3.1-pro-preview',
                     contents=prompt_utilisateur,
                     config=types.GenerateContentConfig(
                         system_instruction=instructions,
-                        temperature=0.1
+                        temperature=0.2 # Température basse pour privilégier la logique
                     )
                 )
 
