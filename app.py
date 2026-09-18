@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# UTILITAIRES ET GESTION D'ÉTAT
+# GESTION D'ÉTAT & NORMALISATION
 # ==========================================
 def normaliser_personnage(item: dict) -> dict:
     """Standardise les clés JSON pour accepter différentes nomenclatures et assigne un UUID unique."""
@@ -28,11 +28,11 @@ def normaliser_personnage(item: dict) -> dict:
     z_tur = item.get("z_tur", item.get("ztur", False))
     url = item.get("url", item.get("lien", ""))
     
-    # Nettoyage de base du nom pour la tolérance (espaces superflus)
-    nom = " ".join(nom.split())
+    # Nettoyage de base du nom
+    nom = " ".join(str(nom).split())
     
     return {
-        "_id": str(uuid.uuid4()), # Identifiant unique pour éviter la KeyError des widgets Streamlit
+        "_id": str(uuid.uuid4()),
         "nom": nom,
         "type": type_perso,
         "rarete": rarete,
@@ -45,7 +45,7 @@ if 'box' not in st.session_state:
     st.session_state.box = []
 
 def maj_doublons(char_id: str, widget_key: str):
-    """Callback sécurisé : Met à jour les doublons sans lire st.session_state dans les arguments."""
+    """Callback sécurisé pour mettre à jour les doublons sans KeyError."""
     for char in st.session_state.box:
         if char["_id"] == char_id:
             char["doublons"] = st.session_state[widget_key]
@@ -55,9 +55,12 @@ def supprimer_personnage(char_id: str):
     """Supprime un personnage de manière sécurisée en filtrant par son UUID."""
     st.session_state.box = [c for c in st.session_state.box if c["_id"] != char_id]
 
+# ==========================================
+# SCRAPING AUTO-ADAPTATIF & RÉSILIENT (LLM)
+# ==========================================
 @st.cache_data(show_spinner=False, ttl=86400)
-def scrape_dokkan_card(url: str) -> str:
-    """Scrape intelligemment le contenu d'une fiche Dokkan avec mise en cache."""
+def extraire_texte_brut(url: str) -> str:
+    """Récupère uniquement le texte brut de la page pour le rendre insensible aux changements de design."""
     if not url or "dbz-dokkanbattle.com" not in url:
         return ""
     
@@ -69,41 +72,72 @@ def scrape_dokkan_card(url: str) -> str:
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # Suppression des balises inutiles
         for element in soup(["script", "style", "nav", "footer", "header"]):
             element.extract()
             
-        text = soup.get_text(separator=' | ', strip=True)
-        return text[:4000]
+        # Extraction du texte brut avec espacement pour éviter les mots collés
+        texte = soup.get_text(separator=' ', strip=True)
+        return texte[:8000] # Limite pour le contexte LLM
+    except Exception as e:
+        return f"Erreur d'extraction : {str(e)}"
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def structurer_donnees_llm(texte_brut: str, type_donnee: str, api_key: str) -> str:
+    """Utilise Gemini pour parser le texte brut en JSON structuré."""
+    if not texte_brut or not api_key or "Erreur d'extraction" in texte_brut:
+        return "{}"
+
+    try:
+        client = genai.Client(api_key=api_key)
+        
+        if type_donnee == "carte":
+            instruction = (
+                "Tu es un extracteur de données strict. Extrais les informations de ce texte brut issu de Dokkan Battle "
+                "et réponds UNIQUEMENT en format JSON valide avec les clés suivantes : 'leader_skill', "
+                "'aptitude_passive' (incluant garde, esquive, réduction, stack), 'liens', et 'statistiques_max' (incluant Z-TUR si mentionné). "
+                "Aucun texte avant ou après le JSON."
+            )
+        else:
+            instruction = (
+                "Tu es un extracteur de données strict. Extrais les informations de cet événement/boss Dokkan Battle "
+                "et réponds UNIQUEMENT en format JSON valide avec les clés suivantes : 'phases', 'type_elementaire', "
+                "'immunites' (stun, blocage de spé, etc.), 'degats_speciaux_estimes', et 'mecaniques_speciales' (AOE, annulation d'esquive, etc.). "
+                "Aucun texte avant ou après le JSON."
+            )
+
+        reponse = client.models.generate_content(
+            model='gemini-3.1-pro-preview',
+            contents=texte_brut,
+            config=types.GenerateContentConfig(
+                system_instruction=instruction,
+                temperature=0.0,
+                response_mime_type="application/json"
+            )
+        )
+        return reponse.text
     except Exception:
-        return "Erreur d'extraction de l'URL."
+        return '{"erreur": "Impossible de structurer les données avec l\'IA."}'
 
 # ==========================================
 # BARRE LATÉRALE : SÉCURITÉ ET DONNÉES
 # ==========================================
 st.sidebar.title("⚙️ Paramètres")
 
-# Gestion ultra-sécurisée de l'API Key
-api_key = None
-has_secret_key = False
+# Sécurité Absolue : Récupération de la clé API
+api_key = st.secrets.get("GEMINI_API_KEY", None)
 
-try:
-    if "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        has_secret_key = True
-except Exception:
-    pass
-
-if has_secret_key and api_key:
+if api_key:
     st.sidebar.success("🟢 Service IA connecté")
 else:
     api_key = st.sidebar.text_input(
         "Clé API Gemini", 
         type="password",
-        help="Votre clé ne sera jamais enregistrée publiquement ni affichée."
+        help="Votre clé ne sera jamais affichée en clair ni stockée publiquement."
     )
 
 st.sidebar.divider()
-st.sidebar.header("📦 Import / Export")
+st.sidebar.header("📦 Import / Export de la Box")
 
 fichier_upload = st.sidebar.file_uploader("Importer une box (.json)", type=["json"])
 if fichier_upload is not None:
@@ -111,20 +145,15 @@ if fichier_upload is not None:
         data = json.load(fichier_upload)
         if isinstance(data, list):
             st.session_state.box = [normaliser_personnage(item) for item in data]
-            st.sidebar.success("✅ Box importée et normalisée avec succès !")
+            st.sidebar.success("✅ Box importée avec succès !")
         else:
             st.sidebar.error("❌ Format JSON invalide (liste attendue).")
     except Exception:
-        st.sidebar.error("❌ Impossible de lire ce fichier JSON.")
+        st.sidebar.error("❌ Impossible de lire le fichier JSON.")
 
 if st.session_state.box:
-    # On retire l'_id interne avant l'export pour garder un JSON propre
-    box_export = []
-    for c in st.session_state.box:
-        c_copy = c.copy()
-        c_copy.pop("_id", None)
-        box_export.append(c_copy)
-        
+    # Exclure l'_id interne avant l'export
+    box_export = [{k: v for k, v in c.items() if k != "_id"} for c in st.session_state.box]
     box_json_str = json.dumps(box_export, indent=4, ensure_ascii=False)
     st.sidebar.download_button(
         label="📥 Exporter ma Box",
@@ -135,10 +164,10 @@ if st.session_state.box:
     )
 
 # ==========================================
-# INTERFACE PRINCIPALE
+# INTERFACE PRINCIPALE (ONGLETS)
 # ==========================================
 st.title("🐉 Dokkan Team Builder")
-st.markdown("Optimisez vos équipes de façon stratégique en exploitant le plein potentiel de votre box.")
+st.markdown("Analysez vos cartes à leur plein potentiel et générez l'équipe parfaite pour vos défis.")
 
 onglet_box, onglet_event, onglet_analyse = st.tabs(["🛡️ Ma Box", "🎯 Boss & Événement", "🧠 Génération d'Équipe"])
 
@@ -146,14 +175,14 @@ onglet_box, onglet_event, onglet_analyse = st.tabs(["🛡️ Ma Box", "🎯 Boss
 # ONGLET 1 : GESTION DE LA BOX
 # ------------------------------------------
 with onglet_box:
-    st.subheader("Ajouter un nouveau personnage")
+    st.subheader("Ajouter un personnage")
     
     with st.form("ajout_perso_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            nom_perso = st.text_input("Nom du personnage (ex: Son Gohan Beast, Goku SSJ4)")
+            nom_perso = st.text_input("Nom du personnage (ex: Son Goku Ultra Instinct)")
         with col2:
-            url_perso = st.text_input("URL dbz-dokkanbattle.com (Optionnel)")
+            url_perso = st.text_input("URL dbz-dokkanbattle.com (Optimise fortement l'analyse)")
             
         c_type, c_rar, c_dup, c_ztur = st.columns(4)
         with c_type:
@@ -163,8 +192,8 @@ with onglet_box:
         with c_dup:
             doublons_perso = st.number_input("Doublons", min_value=0, max_value=4, step=1)
         with c_ztur:
-            st.write("") # Espacement
-            ztur_perso = st.checkbox("Possède un Z-TUR ?")
+            st.write("") # Alignement vertical
+            ztur_perso = st.checkbox("Possède un Z-TUR / Super Z-TUR ?")
             
         if st.form_submit_button("➕ Ajouter à la Box"):
             if nom_perso.strip():
@@ -177,13 +206,13 @@ with onglet_box:
                     "z_tur": ztur_perso
                 }
                 st.session_state.box.append(normaliser_personnage(nouvel_item))
-                st.success(f"✅ {nom_perso.strip()} ajouté !")
+                st.success(f"✅ {nom_perso.strip()} a été ajouté !")
                 st.rerun()
             else:
-                st.error("⚠️ Le nom est obligatoire.")
+                st.error("⚠️ Le nom du personnage est requis.")
 
     st.divider()
-    st.subheader(f"Collection actuelle ({len(st.session_state.box)} personnages)")
+    st.subheader(f"Inventaire ({len(st.session_state.box)} cartes)")
     
     if st.session_state.box:
         for perso in st.session_state.box:
@@ -195,8 +224,7 @@ with onglet_box:
             ztur_txt = " | Z-TUR ✅" if perso['z_tur'] else ""
             c_infos.markdown(f"{perso['type']} | {perso['rarete']}{ztur_txt}")
             
-            # Utilisation de l'UUID pour sécuriser la modification d'état
-            cle_widget = f"doublon_widget_{perso['_id']}"
+            cle_widget = f"doublon_{perso['_id']}"
             c_doublon.selectbox(
                 "Doublons",
                 options=[0, 1, 2, 3, 4],
@@ -211,97 +239,132 @@ with onglet_box:
                 supprimer_personnage(perso['_id'])
                 st.rerun()
     else:
-        st.info("La box est vide.")
+        st.info("La box est vide. Importez un fichier JSON ou ajoutez des cartes manuellement.")
 
 # ------------------------------------------
-# ONGLET 2 : LE BOSS
+# ONGLET 2 : LE BOSS (SCRAPING INTELLIGENT)
 # ------------------------------------------
 with onglet_event:
-    st.subheader("Configuration du combat")
+    st.subheader("Configuration et Analyse de l'Événement")
     
-    nom_boss = st.text_input("Nom de l'Événement / Boss (ex: Red Zone Broly, SBR Extrême)")
-    details_boss = st.text_area(
-        "Mécaniques spécifiques (Optionnel mais recommandé)",
-        placeholder="Décrivez les phases, le type du boss, s'il bloque l'esquive, s'il fait des attaques de zone (AOE), les dégâts attendus...",
-        height=150
-    )
+    nom_boss = st.text_input("Nom de l'événement (ex: Red Zone Broly, Combat de l'achèvement)")
+    url_boss = st.text_input("URL dbz-dokkanbattle.com de l'événement (Optionnel mais recommandé pour l'auto-analyse)")
+    details_manuels = st.text_area("Détails supplémentaires ou notes manuelles", height=100)
     
     st.session_state.nom_boss = nom_boss
-    st.session_state.details_boss = details_boss
+    
+    # Bouton pour analyser l'événement si une URL est fournie
+    if st.button("🔍 Extraire les mécaniques du boss via l'URL"):
+        if not api_key:
+            st.error("⚠️ Clé API Gemini requise pour extraire les données du boss.")
+        elif not url_boss:
+            st.error("⚠️ Veuillez renseigner une URL valide.")
+        else:
+            with st.spinner("Lecture de la page et extraction des contraintes du boss par l'IA..."):
+                texte_boss_brut = extraire_texte_brut(url_boss)
+                donnees_boss_json = structurer_donnees_llm(texte_boss_brut, "boss", api_key)
+                st.session_state.details_boss_auto = donnees_boss_json
+                st.success("✅ Analyse du boss terminée et sauvegardée dans le contexte de l'IA.")
+                st.json(donnees_boss_json)
+                
+    st.session_state.details_manuels = details_manuels
 
 # ------------------------------------------
-# ONGLET 3 : GÉNÉRATION D'ÉQUIPE (GEMINI)
+# ONGLET 3 : GÉNÉRATION D'ÉQUIPE (MOTEUR GEMINI 3.1)
 # ------------------------------------------
 with onglet_analyse:
-    st.subheader("Analyse Tactique par l'IA")
+    st.subheader("Génération de la Stratégie")
     
-    if st.button("🚀 Lancer l'analyse et créer l'équipe", type="primary", use_container_width=True):
+    if st.button("🚀 Créer l'équipe optimale", type="primary", use_container_width=True):
         if not api_key:
-            st.error("⚠️ Veuillez configurer votre clé API Gemini dans le panneau latéral.")
+            st.error("⚠️ Clé API Gemini manquante. Veuillez vérifier les paramètres.")
         elif len(st.session_state.box) < 6:
-            st.error("⚠️ Il vous faut au minimum 6 personnages dans votre box pour former une équipe.")
+            st.error("⚠️ Il faut au minimum 6 cartes dans la box.")
         elif not st.session_state.get('nom_boss'):
-            st.error("⚠️ Veuillez indiquer le nom du Boss dans l'onglet précédent.")
+            st.error("⚠️ Veuillez renseigner le nom du Boss dans l'onglet 'Boss & Événement'.")
         else:
-            with st.spinner("Analyse du plein potentiel de vos cartes et calcul de l'équipe optimale..."):
-                try:
-                    # 1. Préparation des données de la box
-                    contexte_box = ""
-                    for p in st.session_state.box:
-                        contexte_box += f"\n- {p['nom']} (Type: {p['type']}, Rareté dans la box: {p['rarete']}, Doublons: {p['doublons']})\n"
-                        # Extraction des infos si l'URL est fournie
-                        texte_scrappe = scrape_dokkan_card(p.get('url', ''))
-                        if texte_scrappe:
-                            contexte_box += f"  Stats/Passif/Liens: {texte_scrappe}\n"
+            barre_progression = st.progress(0)
+            texte_statut = st.empty()
+            
+            try:
+                # 1. Compilation des données structurées de la box
+                contexte_box = ""
+                total_persos = len(st.session_state.box)
+                
+                for index, perso in enumerate(st.session_state.box):
+                    texte_statut.write(f"Analyse de {perso['nom']} ({index+1}/{total_persos})...")
+                    barre_progression.progress((index + 1) / total_persos)
+                    
+                    contexte_box += f"\n### Personnage: {perso['nom']}\n"
+                    contexte_box += f"- Type: {perso['type']}, Rareté actuelle dans la box: {perso['rarete']}, Doublons: {perso['doublons']}\n"
+                    
+                    if perso.get('url'):
+                        texte_carte_brut = extraire_texte_brut(perso['url'])
+                        donnees_carte_json = structurer_donnees_llm(texte_carte_brut, "carte", api_key)
+                        contexte_box += f"- Données extraites de la carte : {donnees_carte_json}\n"
+                    else:
+                        contexte_box += "- Aucune URL fournie. Base-toi sur tes connaissances expertes pour ses mécaniques.\n"
 
-                    # 2. Construction du System Prompt ultra strict
-                    instructions = (
-                        "Tu es le meilleur théorycrafteur et expert mondial du jeu Dragon Ball Z: Dokkan Battle.\n"
-                        "RÈGLES ABSOLUES ET IMPÉRATIVES :\n"
-                        "1. LANGUE : Tu dois t'exprimer EXCLUSIVEMENT en français, avec le vocabulaire officiel du jeu.\n"
-                        "2. RESPECT STRICT DE LA BOX : Tu dois former une équipe de 6 personnages choisis UNIQUEMENT "
-                        "parmi la liste fournie par l'utilisateur. Seul le 7ème personnage ('Ami Leader') peut être extérieur à la box.\n"
-                        "3. PLEIN POTENTIEL (RÈGLE D'OR) : Ne juge JAMAIS une carte sur sa rareté actuelle. "
-                        "Si l'utilisateur a une carte notée 'SSR', évalue-la à son plein potentiel maximum possible (Éveil Dokkan UR ou LR, ainsi que Z-TUR ou Super Z-TUR si disponible dans le jeu). "
-                        "Si tu intègres à l'équipe une carte qui est actuellement 'SSR' dans la box de l'utilisateur, tu dois OBLIGATOIREMENT "
-                        "ajouter cette mention exacte à côté de son nom : '⚠️ À éveiller en UR/LR / Z-TUR pour ce combat'.\n"
-                        "4. STRATÉGIE : Pense à la survie (Garde, Réduction de Dégâts, Esquive, Stack de DEF) face aux mécaniques spécifiques du boss ciblé.\n\n"
-                        "FORMAT DE RÉPONSE EXIGÉ (Markdown clair) :\n"
-                        "🏆 Leader (Préciser le % du Leader Skill)\n"
-                        "👥 Sous-unités (Les 5 autres membres de la box)\n"
-                        "🤝 Ami Leader (Le meilleur allié possible pour accompagner)\n"
-                        "🔄 Rotations (Rotation 1 : Slot 1 et 2 | Rotation 2 : Slot 1 et 2)\n"
-                        "🎈 Flotteurs (Les 3 unités en Slot 3)\n"
-                        "📜 Stratégie (Explication des synergies, qui encaisse les attaques, gestion des objets de soutien comme Whis/Icarus)."
+                texte_statut.write("Construction de la stratégie avec Gemini 3.1 Pro...")
+
+                # 2. Construction du System Prompt (Règles strictes)
+                instructions = (
+                    "Tu es le meilleur expert de Dragon Ball Z: Dokkan Battle. "
+                    "Ton objectif est de générer la meilleure équipe possible pour survivre et vaincre l'événement spécifié.\n\n"
+                    "RÈGLES ABSOLUES ET IMPÉRATIVES :\n"
+                    "1. LANGUE : Toutes tes explications et ton formatage DOIVENT être 100% en français.\n"
+                    "2. EXCLUSIVITÉ DE LA BOX : Sélectionne EXACTEMENT 6 personnages (1 Leader, 5 Sous-unités) qui proviennent "
+                    "UNIQUEMENT de l'inventaire fourni en contexte. N'invente aucune unité. Seul le 7ème personnage ('Ami Leader') peut ne pas être dans la box.\n"
+                    "3. ÉVALUATION AU PLEIN POTENTIEL : C'est la règle d'or. Si une carte de la box est marquée 'SSR' ou 'UR' mais possède un éveil LR ou un Z-TUR / Super Z-TUR existant "
+                    "dans les données du jeu ou le JSON extrait, tu DOIS l'évaluer selon ses statistiques et son passif à son STADE MAXIMAL. "
+                    "Si tu inclus dans l'équipe une carte qui est actuellement faible (ex: SSR) mais forte une fois éveillée, "
+                    "tu DOIS obligatoirement ajouter la mention suivante à côté de son nom : '⚠️ À éveiller en UR/LR / Z-TUR pour ce combat'.\n"
+                    "4. UTILISATION DU JSON : Appuie tes décisions de survie (Garde, Réduction, Esquive) sur les données JSON extraites des cartes et du boss.\n\n"
+                    "FORMAT ATTENDU EN MARKDOWN :\n"
+                    "🏆 **Leader de l'équipe** (et son bonus Leader Skill)\n"
+                    "👥 **Membres de l'équipe** (les 5 cartes avec mention d'éveil si nécessaire)\n"
+                    "🤝 **Ami Leader recommandé**\n"
+                    "🔄 **Rotations Optimisées** (Rotation 1 : Slot 1 et 2 | Rotation 2 : Slot 1 et 2)\n"
+                    "🎈 **Unités Flottantes** (Les 3 personnages en Slot 3)\n"
+                    "📜 **Stratégie Détaillée** (Comment survivre aux attaques du boss, qui doit stacker sa défense, utilisation d'objets comme Whis)."
+                )
+
+                # 3. Prompt Utilisateur intégrant le Boss et la Box
+                infos_boss_auto = st.session_state.get('details_boss_auto', "Non extraites automatiquement.")
+                details_manuels = st.session_state.get('details_manuels', "")
+                
+                prompt_utilisateur = f"""
+                **Cible :** {st.session_state.nom_boss}
+                **Données structurées du Boss (JSON) :** {infos_boss_auto}
+                **Notes supplémentaires sur le combat :** {details_manuels}
+
+                **Inventaire disponible (Plein potentiel à prendre en compte) :**
+                {contexte_box}
+                """
+
+                # 4. Requête API vers le modèle exigé
+                client = genai.Client(api_key=api_key)
+                reponse_equipe = client.models.generate_content(
+                    model='gemini-3.1-pro-preview',
+                    contents=prompt_utilisateur,
+                    config=types.GenerateContentConfig(
+                        system_instruction=instructions,
+                        temperature=0.1 # Décisions stratégiques froides et calculées
                     )
+                )
 
-                    # 3. Prompt utilisateur
-                    prompt_utilisateur = f"""
-                    **Boss cible :** {st.session_state.nom_boss}
-                    **Détails du boss :** {st.session_state.details_boss}
+                texte_statut.empty()
+                barre_progression.empty()
+                
+                st.success("✅ Analyse stratégique finalisée !")
+                st.markdown("---")
+                st.markdown(reponse_equipe.text)
 
-                    **Ma Box (Inventaire STRICT - Pioche uniquement 6 personnages ici) :**
-                    {contexte_box}
-                    """
-
-                    # 4. Appel API sécurisé
-                    client = genai.Client(api_key=api_key)
-                    reponse = client.models.generate_content(
-                        model='gemini-2.5-pro',
-                        contents=prompt_utilisateur,
-                        config=types.GenerateContentConfig(
-                            system_instruction=instructions,
-                            temperature=0.2 # Très analytique
-                        )
-                    )
-
-                    st.success("✅ Analyse terminée avec succès !")
-                    st.markdown("---")
-                    st.markdown(reponse.text)
-
-                except Exception as e:
-                    # Sécurisation absolue : Remplacement de l'API key par des étoiles si elle fuite dans l'erreur réseau
-                    message_erreur = str(e)
-                    if api_key:
-                        message_erreur = message_erreur.replace(api_key, "******")
-                    st.error(f"❌ Une erreur système est survenue : {message_erreur}")
+            except Exception as e:
+                texte_statut.empty()
+                barre_progression.empty()
+                # Censure totale de la clé API si elle apparaît dans les erreurs (ex: Erreurs HTTP / gRPC)
+                message_erreur = str(e)
+                if api_key:
+                    message_erreur = message_erreur.replace(api_key, "******-MASQUÉ-******")
+                st.error(f"❌ Une erreur critique est survenue durant le traitement de l'IA : {message_erreur}")
